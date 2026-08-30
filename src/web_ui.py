@@ -9,6 +9,11 @@ from flask import Flask, jsonify, request, render_template_string
 try:
     from src.pdf_utils import (
         list_annotations,
+        list_form_fields,
+        detect_form_fields,
+        accept_form_fields,
+        reject_form_fields,
+        update_form_field,
         create_annotation,
         update_annotation,
         delete_annotation,
@@ -16,6 +21,11 @@ try:
 except ModuleNotFoundError:
     from pdf_utils import (
         list_annotations,
+        list_form_fields,
+        detect_form_fields,
+        accept_form_fields,
+        reject_form_fields,
+        update_form_field,
         create_annotation,
         update_annotation,
         delete_annotation,
@@ -39,6 +49,51 @@ TEMPLATE = """
         border: 1px solid #ccc;
         cursor: pointer;
       }
+      .field-control {
+        position: absolute;
+        box-sizing: border-box;
+        border: 1px solid #1976d2;
+        background: rgba(255,255,255,0.85);
+        color: #111;
+        margin: 0;
+      }
+      .field-control[type="checkbox"], .field-control[type="radio"] {
+        accent-color: #1976d2;
+      }
+      .field-candidate {
+        position: absolute;
+        box-sizing: border-box;
+        border: 2px dashed #d97706;
+        background: rgba(255, 237, 213, 0.45);
+        z-index: 1;
+        cursor: pointer;
+        margin: 0;
+        display: flex;
+        flex-direction: row;
+        align-items: flex-start;
+      }
+      .field-candidate:hover,
+      .field-candidate:focus-within {
+        z-index: 3;
+      }
+      .field-candidate button {
+        margin: 2px;
+        cursor: pointer;
+        visibility: hidden;
+      }
+      .field-candidate:hover button,
+      .field-candidate-actions:hover button,
+      .field-candidate:focus-within button {
+        visibility: visible;
+      }
+      .field-candidate-actions {
+        position: relative;
+        z-index: 2;
+        display: flex;
+        flex-direction: row;
+        padding: 5px;
+        margin: -5px;
+      }
     </style>
   </head>
   <body>
@@ -52,32 +107,93 @@ TEMPLATE = """
     async function load(pdf){
       const res = await fetch('/pages?pdf='+encodeURIComponent(pdf));
       const data = await res.json();
+      const fieldsRes = await fetch('/fields/detect?pdf='+encodeURIComponent(pdf));
+      const fieldsData = await fieldsRes.json();
       const viewer = document.getElementById('viewer');
       viewer.innerHTML = '';
       data.pages.forEach((p)=>{
         const div = document.createElement('div'); div.className='page';
         const img = document.createElement('img'); img.src = p.data; img.dataset.pageIndex = p.index;
         img.style.maxWidth = '600px';
-        img.addEventListener('click', async (ev)=>{
-          const rect = ev.target.getBoundingClientRect();
-          const x = Math.round(ev.clientX - rect.left);
-          const y = Math.round(ev.clientY - rect.top);
-          const text = prompt('Annotation text:');
-          if(!text) return;
-          await fetch('/annotations/add', {
-            method: 'POST',
-            headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({
-              pdf: pdf,
-              page: p.index,
-              x: x,
-              y: y,
-              text: text
-            })
-          });
-          load(pdf);
-        });
+        const syncPageSize = ()=>{
+          div.style.width = img.clientWidth + 'px';
+          div.style.height = img.clientHeight + 'px';
+        };
+        img.addEventListener('load', syncPageSize, {once: true});
         div.appendChild(img);
+        if (img.complete) syncPageSize();
+        const addFieldOverlay = (field, candidate)=>{
+          const control = document.createElement(candidate ? 'div' : 'input');
+          control.className = candidate ? 'field-candidate' : 'field-control';
+          if (candidate) {
+            const actions = document.createElement('div');
+            actions.className = 'field-candidate-actions';
+            control.appendChild(actions);
+            const action = (text, endpoint)=>{
+              const button = document.createElement('button');
+              button.type = 'button';
+              button.textContent = text;
+              button.addEventListener('click', async (ev)=>{
+                ev.stopPropagation();
+                await fetch(endpoint, {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({pdf: pdf, fields: [field]})
+                });
+                load(pdf);
+              });
+              actions.appendChild(button);
+            };
+            action('Accept', '/fields/accept');
+            action('Reject', '/fields/reject');
+            control.title = 'Review detected field';
+          }
+          if (!candidate) {
+            control.type = field.type === 'checkbox' ? 'checkbox' :
+              (field.type === 'radio' ? 'radio' : (field.type === 'integer' ? 'number' : 'text'));
+          }
+          const rect = field.rect;
+          const render = ()=>{
+            const scale = img.clientWidth / p.width;
+            const candidateBuffer = 2;
+            const buffer = candidate ? candidateBuffer : 0;
+            control.style.left = (rect[0] * scale - buffer) + 'px';
+            control.style.top = (rect[1] * scale - buffer) + 'px';
+            control.style.width = ((rect[2] - rect[0]) * scale + buffer * 2) + 'px';
+            control.style.height = ((rect[3] - rect[1]) * scale + buffer * 2) + 'px';
+          };
+          if (!candidate) {
+            if (control.type === 'checkbox' || control.type === 'radio') {
+              control.checked = Boolean(field.value);
+            } else if (field.value !== null && field.value !== undefined) {
+              control.value = field.value;
+            }
+            control.addEventListener('change', async ()=>{
+              const value = control.type === 'checkbox' || control.type === 'radio'
+                ? control.checked : control.value;
+              await fetch('/fields/edit', {
+                method: 'POST',
+                headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({pdf: pdf, id: field.id, props: {value: value}})
+              });
+            });
+            if (control.type === 'radio') {
+              let radioWasChecked = false;
+              control.addEventListener('mousedown', ()=>{ radioWasChecked = control.checked; });
+              control.addEventListener('click', ()=>{
+                if (radioWasChecked) {
+                  control.checked = false;
+                  control.dispatchEvent(new Event('change'));
+                }
+              });
+            }
+          }
+          img.addEventListener('load', render, {once: true});
+          div.appendChild(control);
+          if (img.complete) render();
+        };
+        fieldsData.accepted.filter((field)=>field.page===p.index).forEach((field)=>addFieldOverlay(field, false));
+        fieldsData.fields.filter((field)=>field.page===p.index).forEach((field)=>addFieldOverlay(field, true));
         (data.annotations[p.index]||[]).forEach(a=>{
           const d = document.createElement('div'); d.className='ann'; d.textContent = a.text;
           d.style.left = (a.x)+'px'; d.style.top = (a.y)+'px'; d.dataset.id = a.id;
@@ -141,16 +257,96 @@ def pages():
         return jsonify({"error": "file not found"}), 404
     doc = fitz.open(str(p))
     pages_list = []
-    for i in range(len(doc)):
+    for i in range(len(doc)):  # pylint: disable=consider-using-enumerate
+        page = doc[i]
         img = _render_page_image(p, i)
         b64 = "data:image/png;base64," + base64.b64encode(img).decode("ascii")
-        pages_list.append({"data": b64, "index": i + 1})
+        pages_list.append(
+            {
+                "data": b64,
+                "index": i + 1,
+                "width": page.rect.width,
+                "height": page.rect.height,
+            }
+        )
     doc.close()
     anns = list_annotations(str(p))
     by_page = {}
     for a in anns:
         by_page.setdefault(int(a["page"]), []).append(a)
     return jsonify({"pages": pages_list, "annotations": by_page})
+
+
+@app.route("/fields/detect")
+def detect_fields_route():
+    """Return detected candidates and accepted fields for a PDF."""
+    pdf = request.args.get("pdf")
+    if not pdf:
+        return jsonify({"error": "missing pdf"}), 400
+    path = Path(pdf)
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    accepted = list_form_fields(str(path))
+    candidates = detect_form_fields(str(path))
+    accepted_regions = {(field["page"], tuple(field["rect"])) for field in accepted}
+    candidates = [
+        field
+        for field in candidates
+        if (field["page"], tuple(field["rect"])) not in accepted_regions
+    ]
+    return jsonify({"fields": candidates, "accepted": accepted})
+
+
+@app.route("/fields/accept", methods=["POST"])
+def accept_fields_route():
+    """Persist reviewed field candidates for a PDF."""
+    data = request.get_json() or {}
+    pdf = data.get("pdf")
+    if not pdf:
+        return jsonify({"error": "missing pdf"}), 400
+    path = Path(pdf)
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    try:
+        ids = accept_form_fields(str(path), data.get("fields", []))
+    except (KeyError, TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"ids": ids})
+
+
+@app.route("/fields/reject", methods=["POST"])
+def reject_fields_route():
+    """Persist reviewed field candidates that should be ignored."""
+    data = request.get_json() or {}
+    pdf = data.get("pdf")
+    if not pdf:
+        return jsonify({"error": "missing pdf"}), 400
+    path = Path(pdf)
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    try:
+        ids = reject_form_fields(str(path), data.get("fields", []))
+    except (KeyError, TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"ids": ids})
+
+
+@app.route("/fields/edit", methods=["POST"])
+def edit_fields_route():
+    """Update an accepted field's value or properties."""
+    data = request.get_json() or {}
+    pdf = data.get("pdf")
+    field_id = data.get("id")
+    if not pdf or not field_id:
+        return jsonify({"error": "missing pdf or field id"}), 400
+    path = Path(pdf)
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    try:
+        update_form_field(str(path), field_id, data.get("props", {}))
+    except (KeyError, TypeError, ValueError) as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"ok": True})
 
 
 @app.route("/annotations/add", methods=["POST"])

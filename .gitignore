@@ -1,7 +1,9 @@
 /.pytest_cache
 /.venv
 /out
-/Playbook - The Ranger.pdf
-/Playbook - The Ranger.pdf.annotations.json
+/*.pdf
+/*.pdf.annotations.json
+/*.pdf.fields.json
+/*.pdf.rejected-fields.json
 /src/__pycache__
 /test/__pycache__
